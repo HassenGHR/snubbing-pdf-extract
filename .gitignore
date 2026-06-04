@@ -1,0 +1,15 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment
+.env
+
+# Output artifacts (review locally, don't commit)
+output/
+pages/
+
+# PDFs (large binary inputs)
+*.pdf

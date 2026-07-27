@@ -148,7 +148,8 @@ runs with different PDFs don't collide.
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--pdf PATH` | required | Input PDF |
+| `--pdf PATH` | required* | Input PDF (*use `--pdf` OR `--images`, not both) |
+| `--images DIR/GLOB` | required* | Folder of page images or glob (e.g. `BYL01/*.png`) — skips PDF rendering |
 | `--outdir DIR` | `output` | Base output dir; files go to `<outdir>/<pdf-stem>/` |
 | `--name FOO` | (PDF stem) | Override the per-PDF subdir name |
 | `--pages 1,5,10` | (all) | Only process these 1-indexed pages |
@@ -321,6 +322,12 @@ shape is:
 python extract.py --pdf PATH [--outdir DIR] [--name FOO]
                   [--pages 1,3,5] [--model MODEL] [--dpi N]
                   [--max-retries N]
+
+# Or skip the PDF and feed already-rendered page images directly:
+python extract.py --images DIR_OR_GLOB [--outdir DIR] [--name FOO]
+                  [--model MODEL] [--max-retries N]
+#   DIR_OR_GLOB: a folder of *.png/*.jpg pages, or a glob like 'BYL01/*.png'
+#   Output goes to <outdir>/<dir-name>/ (override with --name).
 ```
 
 ### `render_pdf_pages.py` (Flow B step 1)

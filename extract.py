@@ -13,6 +13,7 @@ and the README.
 
 import argparse
 import base64
+import glob as _glob
 import io
 import json
 import os
@@ -20,7 +21,8 @@ import re
 import sys
 import time as _time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+import zipfile
 
 import pypdfium2 as pdfium
 from dotenv import load_dotenv
@@ -46,11 +48,16 @@ def render_page_png(pdf: pdfium.PdfDocument, page_index: int, dpi: int) -> bytes
 # Gemini call
 # ---------------------------------------------------------------------------
 
-def extract_with_gemini(client: "genai.Client", model: str, image_bytes: bytes) -> Dict[str, Any]:
+def extract_with_gemini(
+    client: "genai.Client",
+    model: str,
+    image_bytes: bytes,
+    mime_type: str = "image/png",
+) -> Dict[str, Any]:
     resp = client.models.generate_content(
         model=model,
         contents=[
-            types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
             "Extract this report as JSON.",
         ],
         config=types.GenerateContentConfig(
@@ -87,9 +94,16 @@ def extract_with_gemini(client: "genai.Client", model: str, image_bytes: bytes) 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Convert each page of an image-based SDR PDF into a per-page FR-SH xlsx.",
+        description="Convert each page of an image-based SDR PDF (or a folder of "
+        "already-rendered images) into a per-page FR-SH xlsx.",
     )
-    ap.add_argument("--pdf", required=True, help="Input PDF path")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--pdf", help="Input PDF path")
+    src.add_argument(
+        "--images",
+        help="Directory of page images (png/jpg) or a glob (e.g. 'BYL01/*.png'). "
+        "Use this when you already have rendered pages instead of a PDF.",
+    )
     ap.add_argument(
         "--outdir",
         default="output",
@@ -127,33 +141,81 @@ def main() -> int:
         print("ERROR: GEMINI_API_KEY is not set. Put it in .env or export it.", file=sys.stderr)
         return 2
 
-    pdf_path = Path(args.pdf)
-    if not pdf_path.exists():
-        print(f"ERROR: {pdf_path} not found.", file=sys.stderr)
-        return 2
-
-    subdir_name = safe_dir_name(args.name or pdf_path.stem)
-    out_dir = Path(args.outdir) / subdir_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-    pdf = pdfium.PdfDocument(str(pdf_path))
-    n_pages = len(pdf)
 
-    if args.pages.strip():
-        page_indices: List[int] = []
-        for tok in args.pages.split(","):
-            tok = tok.strip()
-            if not tok:
+    ok = 0
+    fail = 0
+    failures: List[str] = []
+
+    # Build a uniform list of (label, image_bytes, mime_type, stem_base).
+    sources: List[Tuple[str, bytes, str, str]] = []
+    if args.pdf:
+        pdf_path = Path(args.pdf)
+        if not pdf_path.exists():
+            print(f"ERROR: {pdf_path} not found.", file=sys.stderr)
+            return 2
+        subdir_name = safe_dir_name(args.name or pdf_path.stem)
+        out_dir = Path(args.outdir) / subdir_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        pdf = pdfium.PdfDocument(str(pdf_path))
+        n_pages = len(pdf)
+        if args.pages.strip():
+            page_indices: List[int] = []
+            for tok in args.pages.split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                page_indices.append(int(tok) - 1)
+        else:
+            page_indices = list(range(n_pages))
+
+        for page_idx in page_indices:
+            page_num = page_idx + 1
+            label = f"page {page_num:02d}"
+            try:
+                img_bytes = render_page_png(pdf, page_idx, dpi=args.dpi)
+            except Exception as e:  # noqa: BLE001
+                print(f"[?/{n_pages}] {label}: render FAIL: {e}")
+                fail += 1
+                failures.append(f"p{page_num}: render: {e}")
                 continue
-            page_indices.append(int(tok) - 1)
-    else:
-        page_indices = list(range(n_pages))
+            sources.append((label, img_bytes, "image/png", f"p{page_num:02d}"))
+        source_desc = f"PDF: {pdf_path} ({n_pages} pages)"
+    else:  # --images: already-rendered page images
+        img_dir = Path(args.images)
+        if img_dir.is_dir():
+            files = []
+            for ext in ("*.png", "*.jpg", "*.jpeg", "*.PNG", "*.JPG", "*.JPEG"):
+                files.extend(img_dir.glob(ext))
+            files = sorted(set(files))
+        else:
+            files = sorted(set(Path(p) for p in _glob.glob(args.images)))
 
-    print(f"PDF: {pdf_path} ({n_pages} pages)")
+        if not files:
+            print(f"ERROR: no images found for {args.images!r}.", file=sys.stderr)
+            return 2
+
+        subdir_name = safe_dir_name(args.name or img_dir.name)
+        out_dir = Path(args.outdir) / subdir_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        for f in files:
+            mime = "image/png" if f.suffix.lower() == ".png" else "image/jpeg"
+            try:
+                img_bytes = f.read_bytes()
+            except Exception as e:  # noqa: BLE001
+                print(f"{f.name}: read FAIL: {e}")
+                fail += 1
+                failures.append(f"{f.name}: read: {e}")
+                continue
+            sources.append((f.name, img_bytes, mime, f.stem))
+        source_desc = f"Images: {args.images} ({len(files)} files)"
+
+    print(source_desc)
     print(f"Model: {args.model}")
     print(f"Output: {out_dir.resolve()}")
-    print(f"Processing {len(page_indices)} page(s)")
+    print(f"Processing {len(sources)} source(s)")
     print("-" * 60)
 
     totals = {
@@ -162,26 +224,14 @@ def main() -> int:
         "total_tokens": 0,
         "cached_tokens": 0,
     }
-    ok = 0
-    fail = 0
-    failures: List[str] = []
 
-    for i, page_idx in enumerate(page_indices, 1):
-        page_num = page_idx + 1
-        prefix = f"[{i}/{len(page_indices)}] page {page_num:02d}"
-        try:
-            img_bytes = render_page_png(pdf, page_idx, dpi=args.dpi)
-        except Exception as e:  # noqa: BLE001
-            print(f"{prefix}: render FAIL: {e}")
-            fail += 1
-            failures.append(f"p{page_num}: render: {e}")
-            continue
-
+    for i, (label, img_bytes, mime, stem_base) in enumerate(sources, 1):
+        prefix = f"[{i}/{len(sources)}] {label}"
         last_err: Optional[Exception] = None
         result: Optional[Dict[str, Any]] = None
         for attempt in range(args.max_retries + 1):
             try:
-                result = extract_with_gemini(client, args.model, img_bytes)
+                result = extract_with_gemini(client, args.model, img_bytes, mime)
                 break
             except json.JSONDecodeError as e:
                 last_err = e
@@ -194,7 +244,7 @@ def main() -> int:
         if result is None:
             print(f"{prefix}: extraction FAIL after retries: {last_err}")
             fail += 1
-            failures.append(f"p{page_num}: {last_err}")
+            failures.append(f"{label}: {last_err}")
             continue
 
         data = result["data"]
@@ -204,7 +254,7 @@ def main() -> int:
 
         date_slug = data.get("date") or "unknown-date"
         well_slug = slugify(data.get("well_name"), "unknown")
-        stem = f"p{page_num:02d}_{date_slug}_{well_slug}"
+        stem = f"{stem_base}_{date_slug}_{well_slug}"
         xlsx_path = out_dir / f"{stem}.xlsx"
         json_path = out_dir / f"{stem}.json"
         png_path = out_dir / f"{stem}.png"
@@ -218,19 +268,27 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             print(f"{prefix}: write FAIL: {e}")
             fail += 1
-            failures.append(f"p{page_num}: write: {e}")
+            failures.append(f"{label}: write: {e}")
             continue
 
         n_acts = len(data.get("activities") or [])
         print(f"{prefix}: OK -> {xlsx_path.name}  (acts={n_acts})")
         ok += 1
 
+        # Create zip containing this Excel file (include rig/unit name in filename)
+        rig_slug = slugify(data.get("unit_name"), "unknown-rig")
+        zip_path = out_dir / f"{stem}_{rig_slug}.zip"
+        try:
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.write(xlsx_path, arcname=xlsx_path.name)
+            print(f"Created zip archive: {zip_path}")
+        except Exception as e:
+            print(f"Failed to create zip archive for {xlsx_path.name}: {e}")
+
     print("-" * 60)
     print(f"Done. OK={ok}  FAIL={fail}")
-    print(
-        "Tokens: prompt={prompt_tokens} completion={completion_tokens} "
-        "total={total_tokens} cached={cached_tokens}".format(**totals)
-    )
+    if any(totals.values()):
+        print("Token usage:", totals)
     if failures:
         print("Failures:")
         for f in failures:
